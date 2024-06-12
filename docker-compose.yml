@@ -11,7 +11,7 @@ services:
     depends_on:
       - mongodb
       - rag_api
-    image: ghcr.io/danny-avila/librechat-dev:latest
+    image: repo.eoxvantage.com/eos-librechat/librechat
     restart: always
     user: "${UID}:${GID}"
     extra_hosts:

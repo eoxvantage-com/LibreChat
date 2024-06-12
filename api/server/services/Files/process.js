@@ -22,6 +22,7 @@ const { LB_QueueAsyncCall } = require('~/server/utils/queue');
 const { getStrategyFunctions } = require('./strategies');
 const { determineFileType } = require('~/server/utils');
 const { logger } = require('~/config');
+const fs = require("fs");
 
 const processFiles = async (files) => {
   const promises = [];
@@ -323,6 +324,46 @@ const uploadImageBuffer = async ({ req, context, metadata = {}, resize = true })
  * @param {FileMetadata} params.metadata - Additional metadata for the file.
  * @returns {Promise<void>}
  */
+const processN8NUpload = function (file, id) {
+  const url = 'https://n8nnew.eoxvantage.com/prod/v1/fileuploadtest'; // URL to the webhook endpoint
+
+  // Create a FormData object to send the file
+  const formData = new FormData();
+  // Append the file to the FormData object
+  // const fileBlob = new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' });
+  console.log(file)
+  console.log("id is"+ id)
+  const filename = id;
+  console.log("Im here 15")
+  // const file = new File([fileBlob], filename);
+  const fileBuffer = fs.readFileSync(file.path);
+  console.log("IM here 16")
+  // Create a Blob object from the Buffer
+  const fileBlob = new Blob([fileBuffer], { type:file.mimetype });
+  console.log("Im here 17")
+  formData.append('file', fileBlob, filename);
+  formData.append('filename', filename);
+  try {
+    const response = fetch(url, {
+      method: 'POST',
+      body: formData // Send the FormData object containing the file
+    }).then(res=>{
+      if (response.ok) {
+        const jsonResponse =  response.json();
+        console.log('Response:', jsonResponse);
+      } else {
+        console.error('Error:', response.status);
+      }
+    });
+    console.log("Response is")
+    console.log(response)
+
+  } catch (error) {
+    console.error('Error in process n8n fileupload:', error);
+  }
+
+}
+
 const processFileUpload = async ({ req, res, file, metadata }) => {
   const isAssistantUpload = isAssistantsEndpoint(metadata.endpoint);
   const assistantSource =
@@ -376,7 +417,7 @@ const processFileUpload = async ({ req, res, file, metadata }) => {
     });
     filepath = result.filepath;
   }
-
+  processN8NUpload(file, id);
   const result = await createFile(
     {
       user: req.user.id,
