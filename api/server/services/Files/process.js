@@ -1,5 +1,6 @@
 const path = require('path');
 const mime = require('mime');
+const mimetypes = require('mime-types');
 const { v4 } = require('uuid');
 const {
   isUUID,
@@ -339,7 +340,9 @@ const processN8NUpload = function (file, id) {
   const fileBuffer = fs.readFileSync(file.path);
   console.log("IM here 16")
   // Create a Blob object from the Buffer
-  const fileBlob = new Blob([fileBuffer], { type:file.mimetype });
+  const mimetype = file.mimetype || mimetypes.lookup(file.path) || 'application/octet-stream';
+
+  const fileBlob = new Blob([fileBuffer], { type: mimetype });
   console.log("Im here 17")
   formData.append('file', fileBlob, filename);
   formData.append('filename', filename);
