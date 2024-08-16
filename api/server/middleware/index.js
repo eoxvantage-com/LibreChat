@@ -14,14 +14,18 @@ const requireJwtAuth = require('./requireJwtAuth');
 const validateModel = require('./validateModel');
 const moderateText = require('./moderateText');
 const setHeaders = require('./setHeaders');
+const validate = require('./validate');
 const limiters = require('./limiters');
 const uaParser = require('./uaParser');
 const checkBan = require('./checkBan');
 const noIndex = require('./noIndex');
+const roles = require('./roles');
 
 module.exports = {
   ...abortMiddleware,
+  ...validate,
   ...limiters,
+  ...roles,
   noIndex,
   checkBan,
   uaParser,
