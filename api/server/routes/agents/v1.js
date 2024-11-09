@@ -4,6 +4,7 @@ const { PermissionTypes, Permissions } = require('librechat-data-provider');
 const { requireJwtAuth, generateCheckAccess } = require('~/server/middleware');
 const v1 = require('~/server/controllers/agents/v1');
 const actions = require('./actions');
+const tools = require('./tools');
 
 const upload = multer();
 const router = express.Router();
@@ -34,11 +35,8 @@ router.use('/actions', actions);
 /**
  * Get a list of available tools for agents.
  * @route GET /agents/tools
- * @returns {TPlugin[]} 200 - application/json
  */
-router.use('/tools', (req, res) => {
-  res.json([]);
-});
+router.use('/tools', tools);
 
 /**
  * Creates an agent.
