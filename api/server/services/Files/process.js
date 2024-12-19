@@ -29,7 +29,6 @@ const { LB_QueueAsyncCall } = require('~/server/utils/queue');
 const { getStrategyFunctions } = require('./strategies');
 const { determineFileType } = require('~/server/utils');
 const { logger } = require('~/config');
-const fs = require("fs");
 
 const processFiles = async (files) => {
   const promises = [];
