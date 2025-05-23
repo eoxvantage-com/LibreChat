@@ -1,4 +1,4 @@
-name: Trigger Another Repository
+name: Trigger Deployment
 
 on:
   push:
