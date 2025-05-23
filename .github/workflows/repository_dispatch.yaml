@@ -1,0 +1,16 @@
+name: Trigger Another Repository
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger repository dispatch
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          repository: eoxvantage-com/EOS-kubernetes
+          event-type: deploy
