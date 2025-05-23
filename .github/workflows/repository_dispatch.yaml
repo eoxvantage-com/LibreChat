@@ -13,4 +13,4 @@ jobs:
         with:
           token: ${{ secrets.PAT_TOKEN }}
           repository: eoxvantage-com/EOS-kubernetes
-          event-type: deploy
+          event-type: librechat-updated
