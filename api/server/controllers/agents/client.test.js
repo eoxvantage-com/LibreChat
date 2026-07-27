@@ -1,6 +1,28 @@
+const mockCreateRun = jest.fn();
+const mockDeleteAgentCheckpoint = jest.fn();
+const mockIsHITLEnabled = jest.fn().mockReturnValue(false);
+const mockBuildAgentScopedContext = jest.fn((...args) =>
+  jest.requireActual('@librechat/api').buildAgentScopedContext(...args),
+);
+const mockFormatAgentMessages = jest.fn(() => ({
+  messages: [],
+  indexTokenCountMap: {},
+  summary: undefined,
+  boundaryTokenAdjustment: undefined,
+}));
+
 const { Providers } = require('@librechat/agents');
-const { Constants, EModelEndpoint } = require('librechat-data-provider');
+const { Constants, ContentTypes, EModelEndpoint } = require('librechat-data-provider');
 const AgentClient = require('./client');
+const { resolveConfigServers } = require('~/server/services/MCP');
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 jest.mock('@librechat/agents', () => ({
   ...jest.requireActual('@librechat/agents'),
@@ -8,14 +30,20 @@ jest.mock('@librechat/agents', () => ({
     handleLLMEnd: jest.fn(),
     collected: [],
   }),
+  formatAgentMessages: (...args) => mockFormatAgentMessages(...args),
 }));
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  buildAgentScopedContext: (...args) => mockBuildAgentScopedContext(...args),
   checkAccess: jest.fn(),
+  createRun: (...args) => mockCreateRun(...args),
   countFormattedMessageTokens: jest.fn(() => 42),
   countTokens: jest.fn((text) => Math.ceil(String(text ?? '').length / 4)),
+  createTokenCounter: jest.fn(() => jest.fn(() => 0)),
+  deleteAgentCheckpoint: (...args) => mockDeleteAgentCheckpoint(...args),
   initializeAgent: jest.fn(),
+  isHITLEnabled: (...args) => mockIsHITLEnabled(...args),
   createMemoryProcessor: jest.fn(),
   isMemoryAgentEnabled: jest.fn((config) => {
     if (!config || config.disabled === true) return false;
@@ -24,6 +52,7 @@ jest.mock('@librechat/api', () => ({
     return Boolean(agent.id || (agent.provider && agent.model));
   }),
   loadAgent: jest.fn(),
+  maybePrewarmCodeSandbox: jest.fn(),
 }));
 
 jest.mock('~/server/services/Config', () => ({
@@ -47,6 +76,120 @@ jest.mock('~/config', () => ({
     formatInstructionsForContext: mockFormatInstructions,
   })),
 }));
+
+describe('AgentClient - applyHideSequentialOutputsFilter', () => {
+  const textPart = (text) => ({ type: ContentTypes.TEXT, text });
+  const toolCallPart = (id) => ({ type: ContentTypes.TOOL_CALL, tool_call: { id } });
+
+  it('keeps only the last part + tool_call parts when hide_sequential_outputs is on', () => {
+    const ctx = {
+      options: { agent: { hide_sequential_outputs: true } },
+      contentParts: [
+        textPart('intermediate'),
+        toolCallPart('tc1'),
+        textPart('reasoning'),
+        textPart('final'),
+      ],
+    };
+    AgentClient.prototype.applyHideSequentialOutputsFilter.call(ctx);
+    expect(ctx.contentParts).toEqual([toolCallPart('tc1'), textPart('final')]);
+  });
+
+  it('is a no-op when hide_sequential_outputs is off', () => {
+    const parts = [textPart('a'), textPart('b')];
+    const ctx = { options: { agent: { hide_sequential_outputs: false } }, contentParts: parts };
+    AgentClient.prototype.applyHideSequentialOutputsFilter.call(ctx);
+    expect(ctx.contentParts).toEqual([textPart('a'), textPart('b')]);
+  });
+});
+
+describe('AgentClient - startup telemetry', () => {
+  it('overlaps run creation with checkpoint pruning and joins both before stream processing', async () => {
+    let releaseCheckpoint;
+    let checkpointStarted;
+    const runCreation = deferred();
+    const checkpointStartedPromise = new Promise((resolve) => {
+      checkpointStarted = resolve;
+    });
+    const checkpointPromise = new Promise((resolve) => {
+      releaseCheckpoint = resolve;
+    });
+    const processStream = jest.fn().mockResolvedValue();
+    const run = {
+      Graph: null,
+      processStream,
+      getCalibrationRatio: jest.fn(() => 0),
+    };
+    const startupTelemetry = {
+      mark: jest.fn(),
+      setStreamId: jest.fn(),
+      recordGenerationEvent: jest.fn(),
+      end: jest.fn(),
+    };
+    mockCreateRun.mockReturnValue(runCreation.promise);
+    mockIsHITLEnabled.mockReturnValue(true);
+    mockDeleteAgentCheckpoint.mockImplementation(() => {
+      checkpointStarted();
+      return checkpointPromise;
+    });
+
+    const client = new AgentClient({
+      req: {
+        user: { id: 'user-123' },
+        body: {},
+        config: { endpoints: { [EModelEndpoint.agents]: { toolApproval: {} } } },
+        _resumableStreamId: 'conversation-123',
+      },
+      res: {},
+      agent: {
+        id: 'agent-123',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4' },
+        hide_sequential_outputs: false,
+      },
+      endpointTokenConfig: {},
+      eventHandlers: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+      startupTelemetry,
+    });
+    client.conversationId = 'conversation-123';
+    client.responseMessageId = 'response-123';
+    client.parentMessageId = 'parent-123';
+    client.recordCollectedUsage = jest.fn().mockResolvedValue();
+
+    const completionPromise = client.chatCompletion({ payload: [] });
+    await checkpointStartedPromise;
+
+    expect(mockCreateRun).toHaveBeenCalledTimes(1);
+    expect(mockDeleteAgentCheckpoint).toHaveBeenCalledWith('conversation-123', undefined);
+    expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
+      'run_input_prepared',
+    ]);
+    expect(processStream).not.toHaveBeenCalled();
+
+    runCreation.resolve(run);
+    await Promise.resolve();
+
+    expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
+      'run_input_prepared',
+      'run_created',
+    ]);
+    expect(processStream).not.toHaveBeenCalled();
+
+    releaseCheckpoint();
+    await completionPromise;
+
+    expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
+      'run_input_prepared',
+      'run_created',
+      'stream_processing_started',
+    ]);
+    expect(processStream).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('AgentClient - titleConvo', () => {
   let client;
@@ -128,6 +271,52 @@ describe('AgentClient - titleConvo', () => {
       ).rejects.toThrow('Run not initialized');
     });
 
+    it('waits for the run in immediate mode instead of throwing', async () => {
+      client.run = null;
+      const abortController = new AbortController();
+
+      const titlePromise = client.titleConvo({ text: 'Test', abortController, immediate: true });
+
+      // Simulate `chatCompletion` assigning the run (client.js: `this.run = run`).
+      client.run = mockRun;
+      client._resolveRun(mockRun);
+
+      await titlePromise;
+      expect(mockRun.generateTitle).toHaveBeenCalled();
+    });
+
+    it('passes empty contentParts in immediate mode (title from the user input only)', async () => {
+      client.contentParts = [{ type: 'text', text: 'Streaming response so far' }];
+      const abortController = new AbortController();
+
+      await client.titleConvo({ text: 'Hello there', abortController, immediate: true });
+
+      const call = mockRun.generateTitle.mock.calls[0][0];
+      expect(call.contentParts).toEqual([]);
+      expect(call.inputText).toBe('Hello there');
+    });
+
+    it('uses live contentParts in non-immediate (final) mode', async () => {
+      client.contentParts = [{ type: 'text', text: 'Full response' }];
+      const abortController = new AbortController();
+
+      await client.titleConvo({ text: 'Hello there', abortController });
+
+      const call = mockRun.generateTitle.mock.calls[0][0];
+      expect(call.contentParts).toEqual([{ type: 'text', text: 'Full response' }]);
+    });
+
+    it('rejects promptly when aborted before the run initializes in immediate mode', async () => {
+      client.run = null;
+      const abortController = new AbortController();
+      abortController.abort();
+
+      await expect(
+        client.titleConvo({ text: 'Test', abortController, immediate: true }),
+      ).rejects.toThrow('Aborted before run initialization');
+      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+    });
+
     it('should use titlePrompt from endpoint config', async () => {
       const text = 'Test conversation text';
       const abortController = new AbortController();
@@ -177,6 +366,51 @@ describe('AgentClient - titleConvo', () => {
       // Check that generateTitle was called with correct clientOptions
       const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-3.5-turbo');
+    });
+
+    it('preserves Anthropic custom headers on title requests despite omitTitleOptions', async () => {
+      const prevKey = process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
+      try {
+        const req = {
+          user: { id: 'user-123' },
+          body: { model: 'claude-sonnet-4-5', endpoint: EModelEndpoint.anthropic, key: null },
+          config: {
+            endpoints: {
+              [EModelEndpoint.anthropic]: {
+                headers: { 'X-Conversation-Id': '{{LIBRECHAT_BODY_CONVERSATIONID}}' },
+              },
+            },
+          },
+        };
+        const agent = {
+          id: 'agent-anthropic',
+          endpoint: EModelEndpoint.anthropic,
+          provider: EModelEndpoint.anthropic,
+          model_parameters: { model: 'claude-sonnet-4-5' },
+        };
+        const anthropicClient = new AgentClient({ req, res: {}, agent, endpointTokenConfig: {} });
+        anthropicClient.run = mockRun;
+        anthropicClient.responseMessageId = 'response-123';
+        anthropicClient.conversationId = 'convo-123';
+        anthropicClient.contentParts = [{ type: 'text', text: 'Test content' }];
+        anthropicClient.recordCollectedUsage = jest.fn().mockResolvedValue();
+
+        await anthropicClient.titleConvo({ text: 'Hello', abortController: new AbortController() });
+
+        const defaultHeaders =
+          mockRun.generateTitle.mock.calls[0][0].clientOptions?.clientOptions?.defaultHeaders;
+        // Custom header survives the `omitTitleOptions` strip and resolves the conversationId
+        expect(defaultHeaders?.['X-Conversation-Id']).toBe('convo-123');
+        // Provider-managed beta header is preserved alongside it
+        expect(defaultHeaders?.['anthropic-beta']).toBeDefined();
+      } finally {
+        if (prevKey === undefined) {
+          delete process.env.ANTHROPIC_API_KEY;
+        } else {
+          process.env.ANTHROPIC_API_KEY = prevKey;
+        }
+      }
     });
 
     it('should handle missing endpoint config gracefully', async () => {
@@ -1306,6 +1540,112 @@ describe('AgentClient - titleConvo', () => {
       client.maxContextTokens = 4096;
     });
 
+    it('loads RAG, memory, attachment, and MCP context without serial waits', async () => {
+      const ragContext = deferred();
+      const memoryContext = deferred();
+      const mcpConfig = deferred();
+      client.contextHandlers = {
+        createContext: jest.fn(() => ragContext.promise),
+      };
+      client.useMemory = jest.fn(() => memoryContext.promise);
+      resolveConfigServers.mockReturnValueOnce(mcpConfig.promise);
+
+      const buildPromise = client.buildMessages(
+        [
+          {
+            messageId: 'msg-1',
+            parentMessageId: null,
+            sender: 'User',
+            text: 'Load all context.',
+            isCreatedByUser: true,
+          },
+        ],
+        null,
+        {},
+      );
+
+      expect(client.contextHandlers.createContext).toHaveBeenCalledTimes(1);
+      expect(client.useMemory).toHaveBeenCalledTimes(1);
+      expect(resolveConfigServers).toHaveBeenCalledWith(mockReq);
+
+      ragContext.resolve('Retrieved context');
+      memoryContext.resolve(undefined);
+      mcpConfig.resolve({});
+      await buildPromise;
+
+      expect(client.augmentedPrompt).toBe('Retrieved context');
+      expect(client.options.agent.additional_instructions).toContain('Retrieved context');
+    });
+
+    it('starts independent context and current-file work at their earliest dependency barriers', async () => {
+      const requestAttachments = deferred();
+      const memoryContext = deferred();
+      const mcpConfig = deferred();
+      const agentScopedContext = deferred();
+      const fileContext = deferred();
+      const providerAttachments = deferred();
+      const requestFile = {
+        file_id: 'request-file',
+        filename: 'request.txt',
+        source: 'text',
+        type: 'text/plain',
+      };
+
+      client.options.attachments = requestAttachments.promise;
+      client.useMemory = jest.fn(() => memoryContext.promise);
+      resolveConfigServers.mockReturnValueOnce(mcpConfig.promise);
+      mockBuildAgentScopedContext.mockReturnValueOnce(agentScopedContext.promise);
+      client.addFileContextToMessage = jest.fn(() => fileContext.promise);
+      client.processAttachments = jest.fn(() => providerAttachments.promise);
+
+      const buildPromise = client.buildMessages(
+        [
+          {
+            messageId: 'msg-early-context',
+            parentMessageId: null,
+            sender: 'User',
+            text: 'Load the request file.',
+            isCreatedByUser: true,
+          },
+        ],
+        'msg-early-context',
+        {},
+      );
+
+      expect(client.useMemory).toHaveBeenCalledTimes(1);
+      expect(resolveConfigServers).toHaveBeenCalledWith(mockReq);
+      expect(mockBuildAgentScopedContext).not.toHaveBeenCalled();
+      expect(client.addFileContextToMessage).not.toHaveBeenCalled();
+      expect(client.processAttachments).not.toHaveBeenCalled();
+
+      requestAttachments.resolve([requestFile]);
+      await Promise.resolve();
+
+      expect(mockBuildAgentScopedContext).toHaveBeenCalledTimes(1);
+      const scopedContextArgs = mockBuildAgentScopedContext.mock.calls[0][0];
+      expect([...scopedContextArgs.sharedRunAttachmentIds]).toEqual(['request-file']);
+      expect(client.addFileContextToMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ messageId: 'msg-early-context' }),
+        [requestFile],
+      );
+      expect(client.processAttachments).toHaveBeenCalledWith(
+        expect.objectContaining({ messageId: 'msg-early-context' }),
+        [requestFile],
+      );
+
+      providerAttachments.resolve([requestFile]);
+      await Promise.resolve();
+      expect(client.options.attachments).toBe(requestAttachments.promise);
+
+      fileContext.resolve();
+      memoryContext.resolve(undefined);
+      mcpConfig.resolve({});
+      agentScopedContext.resolve(new Map());
+      await buildPromise;
+
+      expect(client.options.attachments).toEqual([requestFile]);
+    });
+
     it('should await MCP instructions and not include [object Promise] in agent instructions', async () => {
       // Set specific return value for this test
       mockFormatInstructions.mockResolvedValue(
@@ -1451,9 +1791,23 @@ describe('AgentClient - titleConvo', () => {
       text,
     });
 
+    const makeUploadedFile = (file_id, filename, type) => ({
+      user: 'user-123',
+      file_id,
+      filename,
+      filepath: `/uploads/${filename}`,
+      object: 'file',
+      type,
+      bytes: 128,
+      embedded: false,
+      usage: 0,
+      source: 'local',
+    });
+
     beforeEach(() => {
       jest.clearAllMocks();
       mockFormatInstructions.mockResolvedValue('');
+      require('@librechat/api').countFormattedMessageTokens.mockImplementation(() => 42);
 
       mockAgent = {
         id: 'primary-agent',
@@ -1498,7 +1852,49 @@ describe('AgentClient - titleConvo', () => {
       client.useMemory = jest.fn().mockResolvedValue(undefined);
     });
 
-    it("applies shared request context plus each agent's own context docs only", async () => {
+    it.each([
+      ['CSV', 'csv-file', 'sample.csv', 'text/csv'],
+      [
+        'XLSX',
+        'xlsx-file',
+        'sample.xlsx',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      ],
+    ])(
+      'routes default-supported provider uploads like %s as request documents without custom file config',
+      async (_label, file_id, filename, type) => {
+        const currentFile = makeUploadedFile(file_id, filename, type);
+        const message = {
+          messageId: 'msg-1',
+          parentMessageId: null,
+          sender: 'User',
+          text: `Read this ${filename}.`,
+          isCreatedByUser: true,
+        };
+
+        client.addDocuments = jest.fn(async (targetMessage, attachments) => {
+          targetMessage.documents = attachments.map((file) => ({
+            type: 'input_file',
+            filename: file.filename,
+            file_data: `data:${file.type};base64,Y29sMQox`,
+          }));
+          return attachments;
+        });
+
+        const files = await client.processAttachments(message, [currentFile]);
+
+        expect(client.addDocuments).toHaveBeenCalledWith(message, [currentFile]);
+        expect(message.documents).toEqual([
+          expect.objectContaining({
+            type: 'input_file',
+            filename,
+          }),
+        ]);
+        expect(files).toEqual([currentFile]);
+      },
+    );
+
+    it('places request context inline and applies each agent context doc only once', async () => {
       const requestFile = makeTextFile('request-file', 'request.txt', 'Shared request context');
       const primaryContext = makeTextFile(
         'primary-context',
@@ -1528,7 +1924,7 @@ describe('AgentClient - titleConvo', () => {
       ]);
       client.agentConfigs = new Map([['handoff-agent', handoffAgent]]);
 
-      await client.buildMessages(
+      const result = await client.buildMessages(
         [
           {
             messageId: 'msg-1',
@@ -1542,13 +1938,97 @@ describe('AgentClient - titleConvo', () => {
         {},
       );
 
-      expect(mockAgent.additional_instructions).toContain('Shared request context');
+      expect(result.prompt[0].content).toContain('Shared request context');
+
       expect(mockAgent.additional_instructions).toContain('Primary private context');
+      expect(mockAgent.additional_instructions).not.toContain('Shared request context');
       expect(mockAgent.additional_instructions).not.toContain('Handoff private context');
 
-      expect(handoffAgent.additional_instructions).toContain('Shared request context');
       expect(handoffAgent.additional_instructions).toContain('Handoff private context');
+      expect(handoffAgent.additional_instructions).not.toContain('Shared request context');
       expect(handoffAgent.additional_instructions).not.toContain('Primary private context');
+    });
+
+    it('places current request file context on the latest user message', async () => {
+      const currentFile = makeTextFile('current-file', 'current.txt', 'Current turn file body');
+      const previousFileContext =
+        'Attached document(s):\n```md\n# "previous.txt"\nPrevious turn file body\n```';
+
+      client.options.attachments = [currentFile];
+
+      const result = await client.buildMessages(
+        [
+          {
+            messageId: 'msg-1',
+            parentMessageId: null,
+            sender: 'User',
+            text: 'What is written here?',
+            isCreatedByUser: true,
+            fileContext: previousFileContext,
+          },
+          {
+            messageId: 'msg-2',
+            parentMessageId: 'msg-1',
+            sender: 'Assistant',
+            text: 'It describes the previous file.',
+            isCreatedByUser: false,
+          },
+          {
+            messageId: 'msg-3',
+            parentMessageId: 'msg-2',
+            sender: 'User',
+            text: 'What is written here?',
+            isCreatedByUser: true,
+          },
+        ],
+        'msg-3',
+        {},
+      );
+
+      expect(result.prompt[0].content).toContain('Previous turn file body');
+      expect(result.prompt[2].content).toContain('Current turn file body');
+      expect(result.prompt[2].content).toContain('What is written here?');
+      expect(result.prompt[2].content).not.toContain('Previous turn file body');
+      expect(client.memoryPayload[2].content).toContain('What is written here?');
+      expect(client.memoryPayload[2].content).not.toContain('Current turn file body');
+      expect(mockAgent.additional_instructions ?? '').not.toContain('Current turn file body');
+      expect(result.prompt[2].content.indexOf('Current turn file body')).toBeLessThan(
+        result.prompt[2].content.indexOf('What is written here?'),
+      );
+    });
+
+    it('persists canonical token counts while counting request file context for the prompt', async () => {
+      const { countFormattedMessageTokens } = require('@librechat/api');
+      const currentFile = makeTextFile('current-file', 'current.txt', 'Current turn file body');
+
+      countFormattedMessageTokens.mockImplementation(({ content }) => {
+        const text = Array.isArray(content)
+          ? content.map((part) => part.text ?? part[ContentTypes.TEXT] ?? '').join('\n')
+          : String(content ?? '');
+        return text.includes('Current turn file body') ? 200 : 20;
+      });
+
+      client.options.attachments = [currentFile];
+
+      const result = await client.buildMessages(
+        [
+          {
+            messageId: 'msg-1',
+            parentMessageId: null,
+            sender: 'User',
+            text: 'What is written here?',
+            isCreatedByUser: true,
+          },
+        ],
+        'msg-1',
+        {},
+      );
+
+      expect(result.prompt[0].content).toContain('Current turn file body');
+      expect(result.tokenCountMap['msg-1']).toBe(20);
+      expect(result.promptTokens).toBe(200);
+      expect(client.indexTokenCountMap[0]).toBe(200);
+      expect(client.memoryPayload[0].content).toBe('What is written here?');
     });
 
     it('does not duplicate a file that is both request context and scoped context', async () => {
@@ -1558,7 +2038,7 @@ describe('AgentClient - titleConvo', () => {
       client.options.agentContextAttachmentsByAgentId = new Map([['primary-agent', [sharedFile]]]);
       client.agentConfigs = new Map();
 
-      await client.buildMessages(
+      const result = await client.buildMessages(
         [
           {
             messageId: 'msg-1',
@@ -1572,10 +2052,10 @@ describe('AgentClient - titleConvo', () => {
         {},
       );
 
-      const occurrences = (
-        mockAgent.additional_instructions.match(/Shared duplicate context/g) ?? []
-      ).length;
-      expect(occurrences).toBe(1);
+      const inlineOccurrences = (result.prompt[0].content.match(/Shared duplicate context/g) ?? [])
+        .length;
+      expect(inlineOccurrences).toBe(1);
+      expect(mockAgent.additional_instructions ?? '').not.toContain('Shared duplicate context');
     });
 
     it('keeps direct chats with context-doc agents working without request attachments', async () => {
@@ -1822,6 +2302,25 @@ describe('AgentClient - titleConvo', () => {
       expect(processedMessage.content).toContain('Response 3');
       expect(processedMessage.content).not.toContain('Message 1');
       expect(processedMessage.content).not.toContain('Response 1');
+    });
+
+    it('should cap memory input tokens and preserve recent content', async () => {
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
+      mockReq.config.memory.maxInputTokens = 12;
+      const messages = [
+        new HumanMessage(`OLDER_CONTENT ${'a'.repeat(600)}`),
+        new AIMessage('Intermediate response'),
+        new HumanMessage('Please remember LATEST_MEMORY_MARKER'),
+      ];
+
+      await client.runMemory(messages);
+
+      expect(mockProcessMemory).toHaveBeenCalledTimes(1);
+      const processedMessage = mockProcessMemory.mock.calls[0][0][0];
+
+      expect(processedMessage.content).toContain('LATEST_MEMORY_MARKER');
+      expect(processedMessage.content).not.toContain('OLDER_CONTENT');
+      expect(Math.ceil(processedMessage.content.length / 4)).toBeLessThanOrEqual(12);
     });
 
     it('should return early if processMemory is not set', async () => {
@@ -2111,7 +2610,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should only pass memory context to the primary agent by default', async () => {
       const memoryContent = 'User prefers dark mode. User is a software developer.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
 
       const parallelAgent1 = {
         id: 'parallel-agent-1',
@@ -2164,7 +2665,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should pass memory context to parallel agents when automatic memory updates are enabled', async () => {
       const memoryContent = 'User prefers dark mode. User is a software developer.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
       mockReq.config.memory.agent = {
         enabled: true,
         id: 'memory-agent',
@@ -2235,7 +2738,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should handle parallel agents without existing instructions when memory stays primary-only', async () => {
       const memoryContent = 'User is a data scientist.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
 
       const parallelAgentNoInstructions = {
         id: 'parallel-agent-no-instructions',
@@ -2271,7 +2776,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should not modify agentConfigs when none exist', async () => {
       const memoryContent = 'User prefers concise responses.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
 
       client.agentConfigs = null;
 
@@ -2297,7 +2804,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('should handle empty agentConfigs map', async () => {
       const memoryContent = 'User likes detailed explanations.';
-      client.useMemory = jest.fn().mockResolvedValue(memoryContent);
+      client.useMemory = jest
+        .fn()
+        .mockResolvedValue({ withKeys: memoryContent, withoutKeys: memoryContent });
 
       client.agentConfigs = new Map();
 
@@ -2413,6 +2922,29 @@ describe('AgentClient - titleConvo', () => {
       );
     });
 
+    it('should bind memory processing to the current generation epoch', async () => {
+      mockReq._resumableStreamId = 'convo-123';
+      mockCheckAccess.mockResolvedValue(true);
+      mockInitializeAgent.mockResolvedValue({
+        ...mockAgent,
+        provider: EModelEndpoint.openAI,
+      });
+      mockCreateMemoryProcessor.mockResolvedValue([undefined, jest.fn()]);
+
+      client = new AgentClient({ ...mockOptions, jobCreatedAt: 1234 });
+      client.conversationId = 'convo-123';
+      client.responseMessageId = 'response-123';
+
+      await client.useMemory();
+
+      expect(mockCreateMemoryProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({
+          streamId: 'convo-123',
+          jobCreatedAt: 1234,
+        }),
+      );
+    });
+
     it('should load different agent when memory config agent.id differs from current agent id', async () => {
       const differentAgentId = 'different-agent-456';
       const differentAgent = {
@@ -2470,7 +3002,7 @@ describe('AgentClient - titleConvo', () => {
 
       const result = await client.useMemory();
 
-      expect(result).toBe('likes pasta');
+      expect(result).toEqual({ withKeys: 'food: likes pasta', withoutKeys: 'likes pasta' });
       expect(mockGetFormattedMemories).toHaveBeenCalledWith({ userId: 'user-123' });
       expect(mockInitializeAgent).not.toHaveBeenCalled();
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
@@ -2495,7 +3027,7 @@ describe('AgentClient - titleConvo', () => {
 
       const result = await client.useMemory();
 
-      expect(result).toBe('');
+      expect(result).toEqual({ withKeys: '', withoutKeys: '' });
       expect(mockGetFormattedMemories).toHaveBeenCalledWith({ userId: 'user-123' });
       expect(mockInitializeAgent).not.toHaveBeenCalled();
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();
@@ -2520,7 +3052,7 @@ describe('AgentClient - titleConvo', () => {
 
       const result = await client.useMemory();
 
-      expect(result).toBe('prefers concise answers');
+      expect(result).toEqual({ withKeys: 'tone: concise', withoutKeys: 'prefers concise answers' });
       expect(mockLoadAgent).not.toHaveBeenCalled();
       expect(mockInitializeAgent).not.toHaveBeenCalled();
       expect(mockCreateMemoryProcessor).not.toHaveBeenCalled();

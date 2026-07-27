@@ -22,22 +22,26 @@ export default function ToolCall({
   initialProgress = 0.1,
   isLast = false,
   isSubmitting,
+  toolCallId,
   name,
   args: _args = '',
   output,
   attachments,
   auth,
   hideAttachments = false,
+  onExpand,
 }: {
   initialProgress: number;
   isLast?: boolean;
   isSubmitting: boolean;
+  toolCallId?: string;
   name: string;
   args: string | Record<string, unknown>;
   output?: string | null;
   attachments?: TAttachment[];
   auth?: string;
   hideAttachments?: boolean;
+  onExpand?: () => void;
 }) {
   const localize = useLocalize();
   const autoExpand = useRecoilValue(store.autoExpandTools);
@@ -163,6 +167,16 @@ export default function ToolCall({
   const progress = useProgress(initialProgress);
   const showCancelled = cancelled || (errorState && !output);
 
+  const handleToggleInfo = useCallback(() => {
+    setShowInfo((prev) => {
+      const next = !prev;
+      if (next) {
+        onExpand?.();
+      }
+      return next;
+    });
+  }, [onExpand]);
+
   const subtitle = useMemo(() => {
     if (isMCPToolCall && mcpServerName) {
       return localize('com_ui_via_server', { 0: mcpServerName });
@@ -202,10 +216,14 @@ export default function ToolCall({
           return getFinishedText();
         })()}
       </span>
-      <div className="relative my-1.5 flex h-5 shrink-0 items-center gap-2.5">
+      <div
+        className="relative my-1.5 flex h-5 shrink-0 items-center gap-2.5"
+        data-testid="tool-call"
+        data-tool-call-id={toolCallId}
+      >
         <ProgressText
           progress={progress}
-          onClick={() => setShowInfo((prev) => !prev)}
+          onClick={handleToggleInfo}
           inProgressText={
             function_name
               ? localize('com_assistants_running_var', { 0: function_name })
@@ -229,7 +247,7 @@ export default function ToolCall({
           error={showCancelled}
         />
       </div>
-      <div style={expandStyle}>
+      <div style={expandStyle} data-tool-call-output-id={toolCallId}>
         <div className="overflow-hidden" ref={expandRef}>
           {hasInfo && (
             <div className="my-2 overflow-hidden rounded-lg border border-border-light bg-surface-secondary">

@@ -320,7 +320,7 @@ describe('SkillsCommand', () => {
       isFetchingNextPage: false,
     });
     mockUseAgentsMapContext.mockReturnValue({
-      agent_1: { id: 'agent_1', skills_enabled: true },
+      agent_1: { id: 'agent_1', skills: [], skills_enabled: true },
     });
 
     const textAreaRef = makeTextarea('$');
@@ -434,6 +434,36 @@ describe('SkillsCommand', () => {
 
     expect(screen.queryByRole('button', { name: /Brand Guidelines/i })).toBeNull();
     expect(screen.getByRole('button', { name: /Style Guide/i })).toBeInTheDocument();
+  });
+
+  it('resumes catalog pagination after an external refetch clears an error', () => {
+    const fetchNextPage = jest.fn();
+    mockUseSkillsInfiniteQuery.mockReturnValue({
+      data: skillsResponse,
+      isLoading: false,
+      isError: true,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+    });
+
+    const textAreaRef = makeTextarea('$');
+    const { rerender } = render(
+      <SkillsCommand index={0} textAreaRef={textAreaRef} conversationId={CONVO_ID} />,
+    );
+    expect(fetchNextPage).not.toHaveBeenCalled();
+
+    mockUseSkillsInfiniteQuery.mockReturnValue({
+      data: skillsResponse,
+      isLoading: false,
+      isError: false,
+      fetchNextPage,
+      hasNextPage: true,
+      isFetchingNextPage: false,
+    });
+    rerender(<SkillsCommand index={1} textAreaRef={textAreaRef} conversationId={CONVO_ID} />);
+
+    expect(fetchNextPage).toHaveBeenCalledTimes(1);
   });
 });
 

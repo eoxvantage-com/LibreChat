@@ -1,11 +1,89 @@
-import logger from '../config/winston';
 import { EToolResources, FileContext } from 'librechat-data-provider';
 import type { FilterQuery, SortOrder, Model } from 'mongoose';
 import type { IMongoFile } from '~/types/file';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
+import logger from '../config/winston';
+
+export type FileOwnerScope = {
+  userId: string;
+  tenantId?: string | null;
+};
+
+function withOwnerScope<T extends FilterQuery<IMongoFile>>(
+  filter: T,
+  ownerScope?: FileOwnerScope,
+): T & FilterQuery<IMongoFile> {
+  if (!ownerScope) {
+    return filter;
+  }
+
+  const scopedFilter: T & FilterQuery<IMongoFile> = {
+    ...filter,
+    user: ownerScope.userId,
+  };
+  if (ownerScope.tenantId) {
+    scopedFilter.tenantId = ownerScope.tenantId;
+  }
+  return scopedFilter;
+}
 
 /** Factory function that takes mongoose instance and returns the file methods */
-export function createFileMethods(mongoose: typeof import('mongoose')) {
+export function createFileMethods(mongoose: typeof import('mongoose')): {
+  findFileById: (file_id: string, options?: Record<string, unknown>) => Promise<IMongoFile | null>;
+  getFiles: (
+    filter: FilterQuery<IMongoFile>,
+    _sortOptions?: Record<string, SortOrder> | null,
+    selectFields?: Record<string, 0 | 1> | string | null,
+  ) => Promise<IMongoFile[] | null>;
+  getExpiredFiles: (limit?: number, now?: Date) => Promise<IMongoFile[]>;
+  getToolFilesByIds: (
+    fileIds: string[],
+    toolResourceSet?: Set<EToolResources>,
+    ownerScope?: FileOwnerScope,
+  ) => Promise<IMongoFile[]>;
+  getCodeGeneratedFiles: (
+    conversationId: string,
+    threadFileIds?: string[],
+    ownerScope?: FileOwnerScope,
+  ) => Promise<IMongoFile[]>;
+  getUserCodeFiles: (fileIds: string[], ownerScope: FileOwnerScope) => Promise<IMongoFile[]>;
+  claimCodeFile: (data: {
+    filename: string;
+    conversationId: string;
+    file_id: string;
+    user: string;
+    tenantId?: string | null;
+    sourceDispatchedAt?: number;
+  }) => Promise<IMongoFile>;
+  createFile: (data: Partial<IMongoFile>, disableTTL?: boolean) => Promise<IMongoFile | null>;
+  updateFile: (
+    data: Partial<IMongoFile> & { file_id: string },
+    extraFilter?: FilterQuery<IMongoFile>,
+  ) => Promise<IMongoFile | null>;
+  updateFileUsage: (data: {
+    file_id: string;
+    inc?: number;
+    user?: string;
+    tenantId?: string | null;
+  }) => Promise<IMongoFile | null>;
+  deleteFile: (file_id: string) => Promise<IMongoFile | null>;
+  deleteFiles: (file_ids: string[], user?: string) => Promise<{ deletedCount?: number }>;
+  deleteFileByFilter: (filter: FilterQuery<IMongoFile>) => Promise<IMongoFile | null>;
+  batchUpdateFiles: (
+    updates: Array<{
+      file_id: string;
+      filepath: string;
+      storageKey?: string;
+      storageRegion?: string;
+    }>,
+  ) => Promise<void>;
+  updateFilesUsage: (
+    files: Array<{ file_id: string }>,
+    fileIds?: string[],
+    options?: { user?: string; tenantId?: string | null },
+  ) => Promise<IMongoFile[]>;
+  sweepOrphanedPreviews: (maxAgeMs?: number) => Promise<number>;
+} {
   /**
    * Finds a file by its file_id with additional query options.
    * @param file_id - The unique identifier of the file
@@ -34,7 +112,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
   async function getFiles(
     filter: FilterQuery<IMongoFile>,
     _sortOptions?: Record<string, SortOrder> | null,
-    selectFields?: SelectProjection | string | null,
+    selectFields?: string | Record<string, 0 | 1> | null | undefined,
   ): Promise<IMongoFile[] | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
     const sortOptions = { updatedAt: -1 as SortOrder, ..._sortOptions };
@@ -47,7 +125,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
     return await query.sort(sortOptions).lean<IMongoFile[]>();
   }
 
-  async function getExpiredFiles(limit = 100, now = new Date()): Promise<IMongoFile[]> {
+  async function getExpiredFiles(limit = 100, now: Date = new Date()): Promise<IMongoFile[]> {
     const File = mongoose.models.File as Model<IMongoFile>;
     return await File.find({ expiredAt: { $ne: null, $lte: now } })
       .sort({ expiredAt: 1 })
@@ -65,6 +143,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
   async function getToolFilesByIds(
     fileIds: string[],
     toolResourceSet?: Set<EToolResources>,
+    ownerScope?: FileOwnerScope,
   ): Promise<IMongoFile[]> {
     if (!fileIds || !fileIds.length || !toolResourceSet?.size) {
       return [];
@@ -85,11 +164,14 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
         return [];
       }
 
-      const filter: FilterQuery<IMongoFile> = {
-        file_id: { $in: fileIds },
-        context: { $ne: FileContext.execute_code },
-        $or: orConditions,
-      };
+      const filter = withOwnerScope(
+        {
+          file_id: { $in: fileIds },
+          context: { $ne: FileContext.execute_code },
+          $or: orConditions,
+        },
+        ownerScope,
+      );
 
       const selectFields: SelectProjection = { text: 0 };
       const sortOptions = { updatedAt: -1 as SortOrder };
@@ -138,6 +220,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
   async function getCodeGeneratedFiles(
     conversationId: string,
     threadFileIds?: string[],
+    ownerScope?: FileOwnerScope,
   ): Promise<IMongoFile[]> {
     if (!conversationId) {
       return [];
@@ -155,12 +238,15 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
     }
 
     try {
-      const filter: FilterQuery<IMongoFile> = {
-        conversationId,
-        context: FileContext.execute_code,
-        file_id: { $in: threadFileIds },
-        'metadata.codeEnvRef': { $exists: true },
-      };
+      const filter = withOwnerScope(
+        {
+          conversationId,
+          context: FileContext.execute_code,
+          file_id: { $in: threadFileIds },
+          'metadata.codeEnvRef': { $exists: true },
+        },
+        ownerScope,
+      );
 
       const selectFields: SelectProjection = { text: 0 };
       const sortOptions = { createdAt: 1 as SortOrder };
@@ -178,19 +264,26 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
    * These are files with fileIdentifier metadata but context is NOT execute_code (e.g., agents or message_attachment).
    * File IDs should be collected from message.files arrays in the current thread.
    * @param fileIds - Array of file IDs to fetch (from message.files in the thread)
+   * @param ownerScope - Authenticated owner scope used to constrain historical refs
    * @returns User-uploaded execute_code files
    */
-  async function getUserCodeFiles(fileIds?: string[]): Promise<IMongoFile[]> {
+  async function getUserCodeFiles(
+    fileIds: string[],
+    ownerScope: FileOwnerScope,
+  ): Promise<IMongoFile[]> {
     if (!fileIds || fileIds.length === 0) {
       return [];
     }
 
     try {
-      const filter: FilterQuery<IMongoFile> = {
-        file_id: { $in: fileIds },
-        context: { $ne: FileContext.execute_code },
-        'metadata.codeEnvRef': { $exists: true },
-      };
+      const filter = withOwnerScope(
+        {
+          file_id: { $in: fileIds },
+          context: { $ne: FileContext.execute_code },
+          'metadata.codeEnvRef': { $exists: true },
+        },
+        ownerScope,
+      );
 
       const selectFields: SelectProjection = { text: 0 };
       const sortOptions = { createdAt: 1 as SortOrder };
@@ -214,12 +307,21 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
     file_id: string;
     user: string;
     tenantId?: string | null;
+    /** The claimant's dispatch-order stamp, persisted on INSERT so a
+     *  freshly claimed (not-yet-written) row still carries an ownership
+     *  signal for the background harvest's stale-output guard. */
+    sourceDispatchedAt?: number;
   }): Promise<IMongoFile> {
     const File = mongoose.models.File as Model<IMongoFile>;
     const tenantFilter = data.tenantId ? { tenantId: data.tenantId } : { tenantId: null };
-    const insertData = data.tenantId
-      ? { file_id: data.file_id, user: data.user, tenantId: data.tenantId }
-      : { file_id: data.file_id, user: data.user };
+    const insertData = {
+      file_id: data.file_id,
+      user: data.user,
+      ...(data.tenantId ? { tenantId: data.tenantId } : {}),
+      ...(data.sourceDispatchedAt != null
+        ? { metadata: { sourceDispatchedAt: data.sourceDispatchedAt } }
+        : {}),
+    };
     const result = await File.findOneAndUpdate(
       {
         filename: data.filename,
@@ -228,7 +330,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
         ...tenantFilter,
       },
       { $setOnInsert: insertData },
-      { upsert: true, new: true },
+      /** `timestamps: false`: a claim is an id reservation, not a content
+       *  write — bumping `updatedAt` here would make the row look freshly
+       *  written to the background harvest's out-of-order guard, which
+       *  compares `updatedAt` against the harvest's start time. */
+      { upsert: true, new: true, timestamps: false },
     ).lean<IMongoFile>();
     if (!result) {
       throw new Error(
@@ -305,14 +411,20 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
   async function updateFileUsage(data: {
     file_id: string;
     inc?: number;
+    user?: string;
+    tenantId?: string | null;
   }): Promise<IMongoFile | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    const { file_id, inc = 1 } = data;
+    const { file_id, inc = 1, user, tenantId } = data;
     const updateOperation = {
       $inc: { usage: inc },
       $unset: { expiresAt: '', temp_file_id: '' },
     };
-    return File.findOneAndUpdate({ file_id }, updateOperation, {
+    // Owner scoping is fail-closed: mismatches leave usage and TTL metadata unchanged.
+    const query: FilterQuery<IMongoFile> = user
+      ? withOwnerScope({ file_id }, { userId: user, tenantId })
+      : { file_id };
+    return File.findOneAndUpdate(query, updateOperation, {
       new: true,
     }).lean<IMongoFile>();
   }
@@ -400,9 +512,13 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
   async function updateFilesUsage(
     files: Array<{ file_id: string }>,
     fileIds?: string[],
+    options?: { user?: string; tenantId?: string | null },
   ): Promise<IMongoFile[]> {
     const promises: Promise<IMongoFile | null>[] = [];
     const seen = new Set<string>();
+    // Preserve the same owner scope for every deduped ID in this batch.
+    const user = options?.user;
+    const tenantId = options?.tenantId;
 
     for (const file of files) {
       const { file_id } = file;
@@ -410,7 +526,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
         continue;
       }
       seen.add(file_id);
-      promises.push(updateFileUsage({ file_id }));
+      promises.push(updateFileUsage({ file_id, user, tenantId }));
     }
 
     if (!fileIds) {
@@ -423,7 +539,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')) {
         continue;
       }
       seen.add(file_id);
-      promises.push(updateFileUsage({ file_id }));
+      promises.push(updateFileUsage({ file_id, user, tenantId }));
     }
 
     const results = await Promise.all(promises);

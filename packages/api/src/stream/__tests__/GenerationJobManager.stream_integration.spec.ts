@@ -1,6 +1,11 @@
 /* eslint jest/no-standalone-expect: ["error", { "additionalTestBlockFunctions": ["testRedis"] }] */
 import type { Redis, Cluster } from 'ioredis';
 import type { ServerSentEvent, StreamEvent, CreatedEvent } from '~/types';
+import {
+  ioredisClient as staticRedisClient,
+  keyvRedisClient as staticKeyvClient,
+  keyvRedisClientReady,
+} from '~/cache/redisClients';
 import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
 import { RedisEventTransport } from '~/stream/implementations/RedisEventTransport';
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
@@ -8,11 +13,6 @@ import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
 import { RedisJobStore } from '~/stream/implementations/RedisJobStore';
 import { createStreamServices } from '~/stream/createStreamServices';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
-import {
-  ioredisClient as staticRedisClient,
-  keyvRedisClient as staticKeyvClient,
-  keyvRedisClientReady,
-} from '~/cache/redisClients';
 
 /** Suppress winston Console transport output (survives jest.resetModules) */
 jest.spyOn(console, 'log').mockImplementation();
@@ -404,11 +404,21 @@ describe('GenerationJobManager Integration Tests', () => {
         await GenerationJobManager.updateMetadata(streamId, {
           sender: 'ConsistencyAgent',
           responseMessageId: 'resp-123',
+          iconURL: 'https://example.com/spec-icon.png',
+          model: 'gpt-4.1',
         });
 
         const updated = await GenerationJobManager.getJob(streamId);
         expect(updated?.metadata?.sender).toBe('ConsistencyAgent');
         expect(updated?.metadata?.responseMessageId).toBe('resp-123');
+        expect(updated?.metadata?.iconURL).toBe('https://example.com/spec-icon.png');
+        expect(updated?.metadata?.model).toBe('gpt-4.1');
+
+        const resumeState = await GenerationJobManager.getResumeState(streamId);
+        expect(resumeState?.sender).toBe('ConsistencyAgent');
+        expect(resumeState?.responseMessageId).toBe('resp-123');
+        expect(resumeState?.iconURL).toBe('https://example.com/spec-icon.png');
+        expect(resumeState?.model).toBe('gpt-4.1');
 
         await GenerationJobManager.completeJob(streamId);
 
@@ -1356,6 +1366,28 @@ describe('GenerationJobManager Integration Tests', () => {
       await manager.destroy();
     });
 
+    test('should include emitted title event in resume state', async () => {
+      const manager = createInMemoryManager();
+      const streamId = `title-resume-${Date.now()}`;
+      await manager.createJob(streamId, 'user-1', streamId);
+
+      const titleEvent = {
+        event: 'title',
+        data: {
+          conversationId: streamId,
+          title: 'Resumed Title',
+        },
+      } satisfies ServerSentEvent;
+
+      await manager.emitChunk(streamId, titleEvent);
+
+      const resumeState = await manager.getResumeState(streamId);
+
+      expect(resumeState?.titleEvent).toEqual(titleEvent);
+
+      await manager.destroy();
+    });
+
     test('should replay buffer by default when no options are passed', async () => {
       const manager = createInMemoryManager();
       const streamId = `replay-buf-${Date.now()}`;
@@ -1646,7 +1678,7 @@ describe('GenerationJobManager Integration Tests', () => {
       await manager.destroy();
     });
 
-    test('should deliver live events after subscribeWithResume', async () => {
+    test('should defer live events until a resumed subscription is activated', async () => {
       const manager = createInMemoryManager();
       const streamId = `atomic-live-${Date.now()}`;
       await manager.createJob(streamId, 'user-1');
@@ -1675,6 +1707,9 @@ describe('GenerationJobManager Integration Tests', () => {
       });
 
       await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(liveEvents.length).toBe(0);
+
+      subscription?.activate();
       expect(liveEvents.length).toBe(1);
       const liveEvent = liveEvents[0] as {
         event: string;
@@ -1719,6 +1754,9 @@ describe('GenerationJobManager Integration Tests', () => {
         });
 
         await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(liveEvents.length).toBe(0);
+
+        subscription?.activate();
         expect(liveEvents.length).toBe(1);
 
         subscription?.unsubscribe();
@@ -1995,10 +2033,6 @@ describe('GenerationJobManager Integration Tests', () => {
       const streamId = `cross-live-${Date.now()}`;
       await replicaA.createJob(streamId, 'user-1');
 
-      const replicaBJobStore = new RedisJobStore(ioredisClient!);
-      await replicaBJobStore.initialize();
-      await replicaBJobStore.createJob(streamId, 'user-1');
-
       const receivedOnB: unknown[] = [];
       const subB = await replicaB.subscribe(streamId, (event: unknown) => receivedOnB.push(event));
 
@@ -2019,7 +2053,6 @@ describe('GenerationJobManager Integration Tests', () => {
       }
 
       subB?.unsubscribe();
-      replicaBJobStore.destroy();
       await replicaA.destroy();
       await replicaB.destroy();
     });
@@ -2044,9 +2077,6 @@ describe('GenerationJobManager Integration Tests', () => {
       const streamId = `cross-seq-safe-${Date.now()}`;
 
       await replicaA.createJob(streamId, 'user-1');
-      const replicaBJobStore = new RedisJobStore(ioredisClient!);
-      await replicaBJobStore.initialize();
-      await replicaBJobStore.createJob(streamId, 'user-1');
 
       const receivedOnB: unknown[] = [];
       const subB = await replicaB.subscribe(streamId, (event: unknown) => receivedOnB.push(event));
@@ -2098,7 +2128,6 @@ describe('GenerationJobManager Integration Tests', () => {
 
       subA?.unsubscribe();
       subB?.unsubscribe();
-      replicaBJobStore.destroy();
       await replicaA.destroy();
       await replicaB.destroy();
     });
@@ -2137,10 +2166,6 @@ describe('GenerationJobManager Integration Tests', () => {
       replicaB.configure(servicesB);
       replicaB.initialize();
 
-      const replicaBJobStore = new RedisJobStore(ioredisClient!);
-      await replicaBJobStore.initialize();
-      await replicaBJobStore.createJob(streamId, 'user-1');
-
       const receivedOnB: unknown[] = [];
       const subB = await replicaB.subscribe(streamId, (event: unknown) => receivedOnB.push(event));
 
@@ -2162,7 +2187,6 @@ describe('GenerationJobManager Integration Tests', () => {
 
       subA?.unsubscribe();
       subB?.unsubscribe();
-      replicaBJobStore.destroy();
       await replicaA.destroy();
       await replicaB.destroy();
     });
@@ -2344,7 +2368,7 @@ describe('GenerationJobManager Integration Tests', () => {
         onDone: () => {},
       });
 
-      await sub1.ready;
+      await expect(sub1.ready).rejects.toThrow('Simulated Redis SUBSCRIBE failure');
 
       const receivedEvents: unknown[] = [];
       sub1.unsubscribe();
@@ -2356,6 +2380,7 @@ describe('GenerationJobManager Integration Tests', () => {
 
       expect(sub2.ready).toBeDefined();
       await sub2.ready;
+      expect(callCount).toBe(2);
 
       await transport.emitChunk(streamId, { event: 'test', data: { value: 'hello' } });
       await new Promise((resolve) => setTimeout(resolve, 100));
