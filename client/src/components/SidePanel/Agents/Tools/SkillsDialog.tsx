@@ -5,6 +5,7 @@ import { PermissionTypes, Permissions } from 'librechat-data-provider';
 import {
   Radio,
   Input,
+  Label,
   Button,
   OGDialog,
   OGDialogTitle,
@@ -18,7 +19,6 @@ import type { AgentItem } from './items/types';
 import type { AgentForm } from '~/common';
 import { useLocalize, useHasAccess, useAuthContext, useToolFavorites } from '~/hooks';
 import { CreateSkillDialog } from '~/components/Skills/dialogs';
-import { skillsEnabledTransition } from './items/mutations';
 import { useSkillsInfiniteQuery } from '~/data-provider';
 import MarketplaceCatalog from './MarketplaceCatalog';
 import { CategoryIcon } from '~/components/Prompts';
@@ -139,15 +139,14 @@ export default function SkillsDialog({ open, onOpenChange, agentId }: SkillsDial
     [catalog, search, category, view, favoriteKeys],
   );
 
+  /** Only the allowlist changes here: the section's mode control owns
+   *  `skills_enabled` and `skills_scope`, and the picker is reachable only from
+   *  `selected` mode. */
   const applySkillsSelection = useCallback(
     (next: string[]) => {
       setValue('skills', next, { shouldDirty: true });
-      const flag = skillsEnabledTransition(next, getValues('skills_enabled'));
-      if (flag !== undefined) {
-        setValue('skills_enabled', flag, { shouldDirty: true });
-      }
     },
-    [getValues, setValue],
+    [setValue],
   );
 
   const handleSkillCreated = useCallback(
@@ -223,9 +222,9 @@ export default function SkillsDialog({ open, onOpenChange, agentId }: SkillsDial
                 />
               </div>
               <CategoryFilter options={categoryOptions} value={category} onChange={setCategory} />
-              <label id="skills-view-label" className="sr-only">
+              <Label id="skills-view-label" className="sr-only">
                 {localize('com_ui_skills_filter')}
-              </label>
+              </Label>
               <Radio
                 options={viewOptions}
                 value={view}
