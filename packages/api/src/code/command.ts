@@ -1,10 +1,15 @@
+import { logger } from '@librechat/data-schemas';
 import { tool } from '@librechat/agents/langchain/tools';
 import {
   BashExecutionToolDefinition,
   BashToolOutputReferencesGuide,
   createBashProgrammaticToolCallingTool,
 } from '@librechat/agents';
-import type { AgentGitIdentity, CodeEnvironmentUserConfigSchema } from 'librechat-data-provider';
+import type {
+  AgentGitIdentity,
+  CodeEnvironmentUserConfigSchema,
+  CodeWorkspaceDescriptor,
+} from 'librechat-data-provider';
 import type { DynamicStructuredTool } from '@librechat/agents/langchain/tools';
 import type { LCTool } from '@librechat/agents';
 import type { WorkspaceExecuteCommandResult } from './workspace';
@@ -88,6 +93,7 @@ export function resolveAttachedWorkspaceCommandTimeoutMax(
 
 export function buildAttachedWorkspaceBashSchema(
   maxTimeoutMs: number = WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
+  environment?: CodeWorkspaceDescriptor['environment'],
 ): NonNullable<LCTool['parameters']> {
   const effectiveMaxTimeoutMs = normalizeAttachedWorkspaceCommandTimeoutMax(maxTimeoutMs);
   return {
@@ -97,8 +103,18 @@ export function buildAttachedWorkspaceBashSchema(
       command: attachedCommandSchema,
       cwd: attachedWorkingDirectorySchema,
       timeoutMs: buildAttachedTimeoutSchema(effectiveMaxTimeoutMs),
+      ...(environment?.actions.length
+        ? {
+            environmentAction: {
+              type: 'string',
+              enum: [...environment.actions],
+              description:
+                'Run a fixed action defined by the machine owner. Supply this instead of command, args or cwd. Normal command approval rules still apply.',
+            },
+          }
+        : {}),
     },
-    required: ['command'],
+    required: environment?.actions.length ? [] : ['command'],
   };
 }
 
@@ -111,10 +127,19 @@ export const ATTACHED_WORKSPACE_BASH_SCHEMA: NonNullable<LCTool['parameters']> =
   buildAttachedWorkspaceBashSchema(),
 );
 
-export function buildAttachedWorkspaceBashDescription(enableToolOutputReferences: boolean): string {
-  return enableToolOutputReferences
+export function buildAttachedWorkspaceBashDescription(
+  enableToolOutputReferences: boolean,
+  environment?: CodeWorkspaceDescriptor['environment'],
+): string {
+  const description = enableToolOutputReferences
     ? `${ATTACHED_WORKSPACE_BASH_DESCRIPTION}\n\n${BashToolOutputReferencesGuide}`
     : ATTACHED_WORKSPACE_BASH_DESCRIPTION;
+  return (
+    description +
+    (environment
+      ? `\n\nSelected project metadata (declared by the machine owner): ${JSON.stringify({ repo: environment.repo, ref: environment.ref })}. Named actions use the environmentAction parameter and the same approval rules as commands.`
+      : '')
+  );
 }
 
 function quoteShellArgument(value: string): string {
@@ -177,6 +202,7 @@ export function createAttachedWorkspaceBashTool({
   baseUrl,
   authHeaders,
   workspaceId,
+  environment,
   gitIdentity,
   maxTimeoutMs = WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
   fetchImpl,
@@ -184,16 +210,22 @@ export function createAttachedWorkspaceBashTool({
   baseUrl: string;
   authHeaders: () => Promise<Record<string, string>> | Record<string, string>;
   workspaceId: string;
+  environment?: CodeWorkspaceDescriptor['environment'];
   gitIdentity?: AgentGitIdentity | null;
   /** Deployment ceiling already intersected with the protocol hard cap. */
   maxTimeoutMs?: number;
   fetchImpl?: CodeBridgeFetch;
 }): DynamicStructuredTool {
   const effectiveMaxTimeoutMs = normalizeAttachedWorkspaceCommandTimeoutMax(maxTimeoutMs);
+  const schema = structuredClone(
+    buildAttachedWorkspaceBashSchema(effectiveMaxTimeoutMs, environment),
+  );
+  const actions = environment?.actions ?? [];
   return tool(
     async (
       rawInput: {
-        command: string;
+        command?: string;
+        environmentAction?: string;
         args?: string[];
         cwd?: string;
         timeoutMs?: number;
@@ -201,41 +233,77 @@ export function createAttachedWorkspaceBashTool({
       },
       config,
     ): Promise<[string, Record<string, never>]> => {
+      const action = rawInput.environmentAction;
+      if (action !== undefined) {
+        if (
+          !environment ||
+          !actions.includes(action) ||
+          rawInput.command !== undefined ||
+          rawInput.args !== undefined ||
+          rawInput.cwd !== undefined
+        ) {
+          throw new Error('Choose an advertised environment action without command, args or cwd.');
+        }
+      } else if (typeof rawInput.command !== 'string' || rawInput.command.trim().length === 0) {
+        throw new Error('Supply a command or an advertised environment action.');
+      }
       if (rawInput.timeoutMs != null && rawInput.timeoutMs > effectiveMaxTimeoutMs) {
         throw new Error(
           `Command timeout exceeds the deployment limit of ${effectiveMaxTimeoutMs} milliseconds.`,
         );
       }
-      const command = commandWithGitIdentity(
-        commandWithArguments(rawInput.command, rawInput.args),
-        gitIdentity,
-      );
+      const command =
+        action ??
+        commandWithGitIdentity(commandWithArguments(rawInput.command!, rawInput.args), gitIdentity);
       const timeoutMs =
         rawInput.timeoutMs ?? Math.min(WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS, effectiveMaxTimeoutMs);
-      const result = await executeWorkspaceTool({
-        baseURL: baseUrl,
-        authHeaders: await authHeaders(),
-        request: {
-          protocolVersion: 1,
-          operation: 'execute_command',
-          workspaceId,
-          command,
-          ...(rawInput.cwd ? { cwd: rawInput.cwd } : {}),
-          timeoutMs,
-          maxOutputBytes: DEFAULT_OUTPUT_BYTES,
-        },
-        signal: config?.signal,
-        fetchImpl,
-      });
-      if (result.operation !== 'execute_command') {
-        throw new Error('Attached workspace returned an unexpected command result.');
+      const signal = config?.signal;
+      const trace = {
+        runId: config?.metadata?.run_id,
+        workspaceId,
+        signalPresent: signal != null,
+      };
+      const onAbort = (): void => {
+        logger.debug('[BYOMCommand] invocation signal aborted', trace);
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      logger.debug('[BYOMCommand] dispatch', { ...trace, aborted: signal?.aborted === true });
+      try {
+        const result = await executeWorkspaceTool({
+          baseURL: baseUrl,
+          authHeaders: await authHeaders(),
+          request: {
+            protocolVersion: 1,
+            operation: 'execute_command',
+            workspaceId,
+            command,
+            ...(action && environment
+              ? { environmentAction: { name: action, fingerprint: environment.fingerprint } }
+              : {}),
+            ...(rawInput.cwd ? { cwd: rawInput.cwd } : {}),
+            timeoutMs,
+            maxOutputBytes: DEFAULT_OUTPUT_BYTES,
+          },
+          signal,
+          fetchImpl,
+        });
+        if (result.operation !== 'execute_command') {
+          throw new Error('Attached workspace returned an unexpected command result.');
+        }
+        logger.debug('[BYOMCommand] transport completed', trace);
+        return [formatCommandResult(result), {}];
+      } finally {
+        signal?.removeEventListener('abort', onAbort);
+        logger.debug('[BYOMCommand] transport settled', {
+          ...trace,
+          aborted: signal?.aborted === true,
+        });
       }
-      return [formatCommandResult(result), {}];
     },
     {
       name: BashExecutionToolDefinition.name,
-      description: ATTACHED_WORKSPACE_BASH_DESCRIPTION,
-      schema: structuredClone(buildAttachedWorkspaceBashSchema(effectiveMaxTimeoutMs)),
+      description: buildAttachedWorkspaceBashDescription(false, environment),
+      schema,
       responseFormat: 'content_and_artifact',
     },
   ) as unknown as DynamicStructuredTool;
